@@ -11,6 +11,10 @@ import { cleanText, formatDuration, formatRuntime } from "../../util/format";
 import { deleteTracks } from "../../library/delete";
 import { SOURCE_LABELS, type SourceId, type Track } from "../../library/types";
 import { shuffledOrder } from "../../player/order";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { execa } from "execa";
+import { resolvedFfmpegPath } from "../../bin/ffmpeg-fetch";
 
 const SOURCE_ORDER: SourceId[] = ["youtube", "soundcloud", "spotify", "link"];
 
@@ -27,7 +31,8 @@ type View = { kind: "sets" } | { kind: "songs"; setKey: string };
 /** Pending delete: one song, or a whole set with everything in it. */
 type Confirm =
   | { kind: "song"; id: string; label: string }
-  | { kind: "set"; key: string; label: string; count: number };
+  | { kind: "set"; key: string; label: string; count: number }
+  | { kind: "convert"; setKey: string; label: string; count: number };
 
 /**
  * Browse the library by set (playlist / likes collection) instead of as one
@@ -61,6 +66,8 @@ export function Playlists() {
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
   const [newTrackTitle, setNewTrackTitle] = useState("");
+  const [converting, setConverting] = useState(false);
+  const [convertProgress, setConvertProgress] = useState<string | null>(null);
 
   const songs = useMemo(
     // library.all() is already newest-first; recompute on new downloads and
@@ -237,6 +244,23 @@ export function Playlists() {
         }
         return;
       }
+      if (input === "c" && !filtering && !confirm && !renamingSet) {
+        const selectedSet = visibleSets.length > 0 ? visibleSets[0] : null;
+        if (selectedSet) {
+          const tracksToConvert = selectedSet.tracks.filter(
+            (t) => !t.filePath.endsWith(".mp3")
+          );
+          if (tracksToConvert.length > 0) {
+            setConfirm({
+              kind: "convert",
+              setKey: selectedSet.key,
+              label: selectedSet.name,
+              count: tracksToConvert.length,
+            });
+          }
+        }
+        return;
+      }
       if (input === "[") stepSourceTab(-1);
       else if (input === "]") stepSourceTab(1);
     },
@@ -280,6 +304,66 @@ export function Playlists() {
     setNewPlaylistName("");
   };
 
+  const convertPlaylistToMp3 = async (setInfo: SetInfo) => {
+    setConverting(true);
+    setConvertProgress("Starting conversion…");
+
+    try {
+      // Create mp3 directory per playlist
+      const mp3Dir = path.join(config.libraryDir, "mp3", cleanText(setInfo.name));
+      await fs.mkdir(mp3Dir, { recursive: true });
+
+      const tracksToConvert = setInfo.tracks.filter(
+        (t) => !t.filePath.endsWith(".mp3")
+      );
+
+      let converted = 0;
+      for (const track of tracksToConvert) {
+        const baseName = path.basename(track.filePath, path.extname(track.filePath));
+        const mp3Path = path.join(mp3Dir, `${baseName}.mp3`);
+
+        // Skip if mp3 already exists
+        try {
+          await fs.access(mp3Path);
+          converted++;
+          continue;
+        } catch {
+          // File doesn't exist, proceed with conversion
+        }
+
+        setConvertProgress(
+          `Converting ${converted + 1}/${tracksToConvert.length}: ${track.title}`
+        );
+
+        try {
+          await execa(resolvedFfmpegPath(), [
+            "-i",
+            track.filePath,
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            mp3Path,
+          ]);
+          converted++;
+        } catch (e) {
+          console.error(`Failed to convert ${track.title}:`, e);
+        }
+      }
+
+      setConvertProgress(
+        `Conversion complete: ${converted}/${tracksToConvert.length} songs converted`
+      );
+      setTimeout(() => setConvertProgress(null), 3000);
+    } catch (e) {
+      setConvertProgress("Conversion failed");
+      console.error("Conversion error:", e);
+      setTimeout(() => setConvertProgress(null), 3000);
+    } finally {
+      setConverting(false);
+    }
+  };
+
   // y commits the pending delete (one song, or a whole set and its folder),
   // esc keeps it. Playback stops first when the playing song is a victim:
   // the player holds the file handle open and Windows refuses the unlink.
@@ -287,6 +371,14 @@ export function Playlists() {
     (input, key) => {
       if (key.escape) setConfirm(null);
       else if (input === "y" && confirm) {
+        if (confirm.kind === "convert") {
+          setConfirm(null);
+          const targetSet = sets.find((s) => s.key === confirm.setKey);
+          if (targetSet) {
+            void convertPlaylistToMp3(targetSet);
+          }
+          return;
+        }
         const victims =
           confirm.kind === "set"
             ? (sets.find((s) => s.key === confirm.key)?.tracks ?? [])
@@ -304,6 +396,11 @@ export function Playlists() {
 
   function confirmText(): string {
     if (!confirm) return "";
+    if (confirm.kind === "convert") {
+      return `Convert '${cleanText(confirm.label)}' to MP3  ${ICON.dot}  ${confirm.count} song${
+        confirm.count === 1 ? "" : "s"
+      }?  y Convert  ${ICON.dot}  esc Cancel`;
+    }
     return confirm.kind === "set"
       ? `Delete '${cleanText(confirm.label)}'  ${ICON.dot}  ${confirm.count} song${
           confirm.count === 1 ? "" : "s"
@@ -437,7 +534,11 @@ export function Playlists() {
       <SourceTabs tabs={tabs} active={filter} count={tabCount} />
       {showSearchRow ? (
         <Box marginBottom={compact ? 0 : 1} flexShrink={0}>
-          {confirm ? (
+          {converting && convertProgress ? (
+            <Text color={COLOR.accent} wrap="truncate-end">
+              {convertProgress}
+            </Text>
+          ) : confirm ? (
             <Text color={COLOR.warn} wrap="truncate-end">
               {confirmText()}
             </Text>

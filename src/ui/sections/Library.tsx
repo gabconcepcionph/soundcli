@@ -10,6 +10,10 @@ import { COLOR, ICON } from "../theme";
 import { cleanText, formatDuration } from "../../util/format";
 import { deleteTracks } from "../../library/delete";
 import { SOURCE_LABELS, type SourceId, type Track } from "../../library/types";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { execa } from "execa";
+import { resolvedFfmpegPath } from "../../bin/ffmpeg-fetch";
 
 const SOURCE_ORDER: SourceId[] = ["youtube", "soundcloud", "spotify", "link"];
 
@@ -58,6 +62,10 @@ export function Library() {
   // Pending track rename.
   const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
   const [newTrackTitle, setNewTrackTitle] = useState("");
+  // Pending convert confirm.
+  const [convertConfirm, setConvertConfirm] = useState<{ count: number } | null>(null);
+  const [converting, setConverting] = useState(false);
+  const [convertProgress, setConvertProgress] = useState<string | null>(null);
 
   const songs = useMemo(
     // library.all() is already newest-first (addedAt desc); recompute on new
@@ -103,12 +111,13 @@ export function Library() {
   // Take over the keyboard only while typing in the search box; a pending
   // delete confirm owns esc so the global one doesn't bounce to the sidebar.
   const renaming = focused && renamingTrackId !== null;
+  const convertingConfirm = focused && convertConfirm !== null;
   useEffect(() => {
     setCaptureMode(
-      editing ? "text" : confirm ? "esc" : renaming ? "text" : "none",
+      editing ? "text" : confirm ? "esc" : renaming ? "text" : convertingConfirm ? "esc" : "none",
     );
     return () => setCaptureMode("none");
-  }, [focused, editing, confirm, renaming, setCaptureMode]);
+  }, [focused, editing, confirm, renaming, convertingConfirm, setCaptureMode]);
 
   // Consume the global "/" intent: arrive with the search box already open.
   useEffect(() => {
@@ -122,17 +131,25 @@ export function Library() {
   //   "/" opens search
   //   "[" / "]" step the source tabs
   //   "t" renames the first visible track
+  //   "c" converts visible tracks to MP3
   useInput(
     (input) => {
       if (input === "/") {
         setEditing(true);
         return;
       }
-      if (input === "t" && !editing && !confirm) {
+      if (input === "t" && !editing && !confirm && !convertConfirm) {
         const firstTrack = visible.length > 0 ? visible[0] : null;
         if (firstTrack) {
           setRenamingTrackId(firstTrack.id);
           setNewTrackTitle(firstTrack.title);
+        }
+        return;
+      }
+      if (input === "c" && !editing && !confirm && !renaming) {
+        const tracksToConvert = visible.filter((t) => !t.filePath.endsWith(".mp3"));
+        if (tracksToConvert.length > 0) {
+          setConvertConfirm({ count: tracksToConvert.length });
         }
         return;
       }
@@ -142,7 +159,7 @@ export function Library() {
         setFilter(tabs[(i + dir + tabs.length) % tabs.length]!);
       }
     },
-    { isActive: focused && !editing && !confirm && !renaming },
+    { isActive: focused && !editing && !confirm && !renaming && !convertConfirm },
   );
 
   // esc closes the search box (back to browsing), without leaving the section.
@@ -164,6 +181,19 @@ export function Library() {
     { isActive: renaming },
   );
 
+  // esc cancels convert confirm, y confirms it.
+  useInput(
+    (input, key) => {
+      if (key.escape) {
+        setConvertConfirm(null);
+      } else if (input === "y" && convertConfirm) {
+        setConvertConfirm(null);
+        void convertVisibleToMp3();
+      }
+    },
+    { isActive: convertingConfirm },
+  );
+
   const handleRenameSubmit = async () => {
     if (!renamingTrackId || !newTrackTitle.trim()) return;
     const track = library.get(renamingTrackId);
@@ -177,6 +207,64 @@ export function Library() {
     await library.upsert({ ...track, title: newTitle });
     setRenamingTrackId(null);
     setNewTrackTitle("");
+  };
+
+  const convertVisibleToMp3 = async () => {
+    setConverting(true);
+    setConvertProgress("Starting conversion…");
+
+    try {
+      // Create mp3 directory
+      const mp3Dir = path.join(config.libraryDir, "mp3");
+      await fs.mkdir(mp3Dir, { recursive: true });
+
+      const tracksToConvert = visible.filter((t) => !t.filePath.endsWith(".mp3"));
+
+      let converted = 0;
+      for (const track of tracksToConvert) {
+        const baseName = path.basename(track.filePath, path.extname(track.filePath));
+        const mp3Path = path.join(mp3Dir, `${baseName}.mp3`);
+
+        // Skip if mp3 already exists
+        try {
+          await fs.access(mp3Path);
+          converted++;
+          continue;
+        } catch {
+          // File doesn't exist, proceed with conversion
+        }
+
+        setConvertProgress(
+          `Converting ${converted + 1}/${tracksToConvert.length}: ${track.title}`
+        );
+
+        try {
+          await execa(resolvedFfmpegPath(), [
+            "-i",
+            track.filePath,
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            mp3Path,
+          ]);
+          converted++;
+        } catch (e) {
+          console.error(`Failed to convert ${track.title}:`, e);
+        }
+      }
+
+      setConvertProgress(
+        `Conversion complete: ${converted}/${tracksToConvert.length} songs converted`
+      );
+      setTimeout(() => setConvertProgress(null), 3000);
+    } catch (e) {
+      setConvertProgress("Conversion failed");
+      console.error("Conversion error:", e);
+      setTimeout(() => setConvertProgress(null), 3000);
+    } finally {
+      setConverting(false);
+    }
   };
 
   // y commits the pending delete, esc keeps the song. Playback stops first
@@ -253,7 +341,7 @@ export function Library() {
   // The search/hint row carries content only while typing, confirming a
   // delete, or showing an active query; when compact and idle, drop it so the
   // list gets the row back.
-  const showSearchRow = !compact || editing || confirm !== null || searching;
+  const showSearchRow = !compact || editing || confirm !== null || convertConfirm !== null || converting || searching;
   // Rows above the list beyond the standard header (which listRows already
   // accounts for): tabs (1) + the search row when shown (2 normally, 1 compact
   // since its margin goes too).
@@ -267,7 +355,15 @@ export function Library() {
           the list's height budget never moves. Hidden when compact + idle. */}
       {showSearchRow ? (
         <Box marginBottom={compact ? 0 : 1}>
-          {confirm ? (
+          {converting && convertProgress ? (
+            <Text color={COLOR.accent} wrap="truncate-end">
+              {convertProgress}
+            </Text>
+          ) : convertConfirm ? (
+            <Text color={COLOR.warn} wrap="truncate-end">
+              {`Convert ${convertConfirm.count} song${convertConfirm.count === 1 ? "" : "s"} to MP3?  y Convert  ${ICON.dot}  esc Cancel`}
+            </Text>
+          ) : confirm ? (
             <Text color={COLOR.warn} wrap="truncate-end">
               {`Delete '${cleanText(confirm.title)}'?  y Delete  ${ICON.dot}  esc Keep`}
             </Text>
