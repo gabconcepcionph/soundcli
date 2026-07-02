@@ -9,13 +9,20 @@ import { SongList, type SongGroup } from "../components/SongList";
 import { COLOR, ICON } from "../theme";
 import { cleanText, formatDuration } from "../../util/format";
 import { deleteTracks } from "../../library/delete";
+import { displaySource } from "../../library/drift";
 import { SOURCE_LABELS, type SourceId, type Track } from "../../library/types";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { execa } from "execa";
 import { resolvedFfmpegPath } from "../../bin/ffmpeg-fetch";
 
-const SOURCE_ORDER: SourceId[] = ["youtube", "soundcloud", "spotify", "link"];
+const SOURCE_ORDER: SourceId[] = [
+  "youtube",
+  "soundcloud",
+  "spotify",
+  "link",
+  "local",
+];
 
 /** Fisher-Yates shuffle (returns a new array). */
 function shuffle<T>(arr: T[]): T[] {
@@ -66,6 +73,7 @@ export function Library() {
   const [convertConfirm, setConvertConfirm] = useState<{ count: number } | null>(null);
   const [converting, setConverting] = useState(false);
   const [convertProgress, setConvertProgress] = useState<string | null>(null);
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
 
   const songs = useMemo(
     // library.all() is already newest-first (addedAt desc); recompute on new
@@ -75,11 +83,19 @@ export function Library() {
     [library, queue.doneCount, libVersion],
   );
 
+  // Tabs group by where each file sits on disk, not where it was downloaded
+  // from, so re-sorting music between the top-level folders re-tabs it.
+  const srcOf = useMemo(() => {
+    const m = new Map<string, SourceId>();
+    for (const t of songs) m.set(t.id, displaySource(t, config.libraryDir));
+    return (t: Track): SourceId => m.get(t.id) ?? t.source;
+  }, [songs, config.libraryDir]);
+
   // Sources that actually have songs, in canonical order, for the filter tabs.
   const presentSources = useMemo(() => {
-    const set = new Set(songs.map((t) => t.source));
+    const set = new Set(songs.map(srcOf));
     return SOURCE_ORDER.filter((s) => set.has(s));
-  }, [songs]);
+  }, [songs, srcOf]);
   const tabs = useMemo<SourceFilter[]>(
     () => ["all", ...presentSources],
     [presentSources],
@@ -89,9 +105,12 @@ export function Library() {
   // segmented control. Counts reflect the whole library, not the search.
   const countBySource = useMemo(() => {
     const m = new Map<SourceId, number>();
-    for (const t of songs) m.set(t.source, (m.get(t.source) ?? 0) + 1);
+    for (const t of songs) {
+      const s = srcOf(t);
+      m.set(s, (m.get(s) ?? 0) + 1);
+    }
     return m;
-  }, [songs]);
+  }, [songs, srcOf]);
   const tabCount = (tb: SourceFilter): number =>
     tb === "all" ? songs.length : countBySource.get(tb) ?? 0;
 
@@ -102,10 +121,10 @@ export function Library() {
 
   // Tracks narrowed to the active source tab.
   const inSource =
-    filter === "all" ? songs : songs.filter((t) => t.source === filter);
+    filter === "all" ? songs : songs.filter((t) => srcOf(t) === filter);
 
   const visible = searching
-    ? library.search(q).filter((t) => filter === "all" || t.source === filter)
+    ? library.search(q).filter((t) => filter === "all" || srcOf(t) === filter)
     : inSource;
 
   // Take over the keyboard only while typing in the search box; a pending
@@ -138,11 +157,11 @@ export function Library() {
         setEditing(true);
         return;
       }
-      if (input === "t" && !editing && !confirm && !convertConfirm) {
-        const firstTrack = visible.length > 0 ? visible[0] : null;
-        if (firstTrack) {
-          setRenamingTrackId(firstTrack.id);
-          setNewTrackTitle(firstTrack.title);
+      if (input === "t" && !editing && !confirm && selectedTrackId) {
+        const track = library.get(selectedTrackId);
+        if (track) {
+          setRenamingTrackId(track.id);
+          setNewTrackTitle(track.title);
         }
         return;
       }
@@ -204,7 +223,22 @@ export function Library() {
       setNewTrackTitle("");
       return;
     }
-    await library.upsert({ ...track, title: newTitle });
+
+    // Move the file on disk to match the new title
+    const oldPath = track.filePath;
+    const oldDir = path.dirname(oldPath);
+    const oldExt = path.extname(oldPath);
+    const newPath = path.join(oldDir, `${cleanText(newTitle)}${oldExt}`);
+
+    try {
+      await fs.rename(oldPath, newPath);
+      await library.upsert({ ...track, title: newTitle, filePath: newPath });
+    } catch (e) {
+      console.error("Failed to rename file:", e);
+      // Still update metadata even if file move failed
+      await library.upsert({ ...track, title: newTitle });
+    }
+
     setRenamingTrackId(null);
     setNewTrackTitle("");
   };
@@ -315,7 +349,7 @@ export function Library() {
   } else if (filter === "all" && presentSources.length > 1) {
     groups = presentSources
       .map((src) => {
-        const tracks = inSource.filter((t) => t.source === src);
+        const tracks = inSource.filter((t) => srcOf(t) === src);
         return {
           title: `${SOURCE_LABELS[src]}  ${ICON.dot}  ${tracks.length}`,
           items: tracks.slice(0, 80).map(toItem),
@@ -417,6 +451,7 @@ export function Library() {
             const t = library.get(value);
             if (t) playTrack(t, visible);
           }}
+          getSelectedValue={setSelectedTrackId}
         />
       )}
     </Box>
