@@ -34,6 +34,10 @@ Every track downloads in its original quality, with album artwork and artist det
 
 It never downloads the same song twice, and if you close it mid-download, it picks up where it left off next time. Once a track is saved, it's there for good. You can rename tracks and playlists directly from the interface to keep everything tidy.
 
+## MP3 conversion
+
+Convert your library to MP3 format for broader compatibility. Press `c` in the Library or Playlists section to convert tracks to MP3. Converted files are saved to a dedicated MP3 folder, with playlist-specific subdirectories for organized storage. The conversion skips files that already exist, so you can run it multiple times without duplicates. Access all your MP3 files from the MP3 section in the sidebar (press `5`), where you can view, play, delete, or open the folder in your system file manager.
+
 ## Playing it back
 
 Everything runs from the keyboard, with controls that are quick to pick up. Press `?` anytime for the full list of keys. The bar along the bottom of the screen only shows the few that matter right now, so there's nothing to memorize.
