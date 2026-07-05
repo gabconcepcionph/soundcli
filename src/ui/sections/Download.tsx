@@ -369,7 +369,7 @@ function QueueView() {
       if (input === "[") {
         if (s.downloading + s.pending > 0) queue.pauseAll();
       } else if (input === "]") {
-        if (s.paused > 0) queue.resumeAll();
+        if (s.paused > 0) void queue.resumeAll();
       } else if (input === "c") {
         if (s.downloading + s.pending + s.paused > 0) queue.cancelAll();
       } else if (key.return) {

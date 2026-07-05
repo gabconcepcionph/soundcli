@@ -420,7 +420,7 @@ export class DownloadQueue extends EventEmitter {
   }
 
   /** Resume one paused item. */
-  resume(id: string): void {
+  async resume(id: string): Promise<void> {
     const item = this.items.find((i) => i.id === id);
     if (!item || item.status !== "paused") return;
     item.status = "pending";
@@ -430,6 +430,15 @@ export class DownloadQueue extends EventEmitter {
     this.rateLimitReason = "";
     this.rateLimitResumeAt = 0;
     this.consecutiveErrors = 0;
+
+    // If there's a scheduled resume for this source, clear it and reset batch count
+    // This allows manual resume to start a fresh batch
+    const { isSourceScheduled, clearSchedule } = await import("./resume-schedule");
+    if (await isSourceScheduled(item.source)) {
+      await clearSchedule(item.source);
+      this.perSourceCounts.set(item.source, 0);
+    }
+
     this.emit("update");
     this.scheduleSave();
     this.pump();
@@ -558,8 +567,8 @@ export class DownloadQueue extends EventEmitter {
     }
   }
 
-  resumeAll(): void {
-    for (const i of this.items) if (i.status === "paused") this.resume(i.id);
+  async resumeAll(): Promise<void> {
+    for (const i of this.items) if (i.status === "paused") await this.resume(i.id);
   }
 
   /** Restore a persisted queue from a previous session. */
@@ -976,7 +985,11 @@ export class DownloadQueue extends EventEmitter {
               (i) => i.source === item.source && (i.status === "pending" || i.status === "downloading"),
             ).length;
             // Always create a schedule so the countdown shows in UI
-            await scheduleResume(item.source, item.sourceLabel, remaining, `batch limit reached (${batchLimit})`);
+            const resumeAt = await scheduleResume(item.source, item.sourceLabel, remaining, `batch limit reached (${batchLimit})`);
+            // Set rate limit flags so UI shows countdown
+            this.rateLimited = true;
+            this.rateLimitReason = `batch limit reached (${batchLimit})`;
+            this.rateLimitResumeAt = resumeAt;
             // Pause remaining items from this source
             for (const i of this.items) {
               if (i.source === item.source && i.status === "pending") {
@@ -1003,7 +1016,11 @@ export class DownloadQueue extends EventEmitter {
           const remaining = this.items.filter(
             (i) => i.source === item.source && (i.status === "pending" || i.status === "downloading"),
           ).length;
-          await scheduleResume(item.source, item.sourceLabel, remaining, `batch limit reached (${batchLimit})`);
+          const resumeAt = await scheduleResume(item.source, item.sourceLabel, remaining, `batch limit reached (${batchLimit})`);
+          // Set rate limit flags so UI shows countdown
+          this.rateLimited = true;
+          this.rateLimitReason = `batch limit reached (${batchLimit})`;
+          this.rateLimitResumeAt = resumeAt;
           for (const i of this.items) {
             if (i.source === item.source && i.status === "pending") {
               i.status = "paused";
