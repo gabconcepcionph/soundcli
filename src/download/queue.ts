@@ -92,14 +92,14 @@ const DEFAULT_CONCURRENCY = 3;
  * Maximum downloads per source per batch before pausing to avoid rate limits.
  * This is "per pagination" - we download in chunks to prevent overwhelming sources.
  * Can be overridden via config.batchLimits.
- * Defaults to 80% of platform rate limits for safety.
+ * Defaults to 60% of platform rate limits for safety (includes cooldown time).
  */
 const DEFAULT_BATCH_LIMITS: Record<string, number> = {
-  youtube: 80, // 80% of 100 requests/hour
-  soundcloud: 160, // 80% of 200 requests/hour
-  spotify: 80, // Uses YouTube's limit
-  link: 80, // Conservative default
-  local: 80, // Conservative default
+  youtube: 60, // 60% of 100 requests/hour
+  soundcloud: 120, // 60% of 200 requests/hour
+  spotify: 60, // Uses YouTube's limit
+  link: 60, // Conservative default
+  local: 60, // Conservative default
 };
 
 /** Platform rate limits (requests per hour) for validation. */
@@ -431,12 +431,19 @@ export class DownloadQueue extends EventEmitter {
     this.rateLimitResumeAt = 0;
     this.consecutiveErrors = 0;
 
-    // If there's a scheduled resume for this source, clear it and reset batch count
-    // This allows manual resume to start a fresh batch
-    const { isSourceScheduled, clearSchedule } = await import("./resume-schedule");
-    if (await isSourceScheduled(item.source)) {
+    // Check if there's a schedule for this source (even if expired)
+    // If cooldown has passed, reset batch count to start fresh
+    const { loadAllSchedules, clearSchedule } = await import("./resume-schedule");
+    const schedules = await loadAllSchedules();
+    const schedule = schedules.find((s) => s.source === item.source);
+    if (schedule) {
+      const now = Date.now();
+      if (schedule.resumeAt <= now) {
+        // Cooldown has passed - reset batch count to start fresh
+        this.perSourceCounts.set(item.source, 0);
+      }
+      // Clear the schedule regardless
       await clearSchedule(item.source);
-      this.perSourceCounts.set(item.source, 0);
     }
 
     this.emit("update");
