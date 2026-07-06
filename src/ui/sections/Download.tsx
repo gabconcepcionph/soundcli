@@ -23,6 +23,7 @@ import {
   displayUrl,
   formatBytesPerSec,
   formatEtaShort,
+  formatTime,
   linkCollectionTitle,
   trackDisplayTitle,
 } from "../../util/format";
@@ -494,7 +495,7 @@ function QueueView() {
                     {`${ICON.dot} ${sourceLabel}: batch complete`}
                     {cooldownSeconds !== null ? (
                       <Text color={COLOR.warn}>
-                        {`  ${ICON.dot}  Next batch in ${Math.floor(cooldownSeconds / 60)}:${(cooldownSeconds % 60).toString().padStart(2, '0')}`}
+                        {`  ${ICON.dot}  Next batch in ${Math.floor(cooldownSeconds / 60)}:${(cooldownSeconds % 60).toString().padStart(2, '0')} (${formatTime(s.rateLimitResumeAt)})`}
                       </Text>
                     ) : null}
                   </>
