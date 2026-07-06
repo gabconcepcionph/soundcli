@@ -579,7 +579,7 @@ export class DownloadQueue extends EventEmitter {
   }
 
   /** Restore a persisted queue from a previous session. */
-  restore(persisted: PersistedItem[], perSourceCounts?: Record<string, number>): void {
+  async restore(persisted: PersistedItem[], perSourceCounts?: Record<string, number>): Promise<void> {
     for (const p of restorableItems(persisted, this.library)) {
       this.items.push({
         id: `q${++counter}`,
@@ -595,6 +595,18 @@ export class DownloadQueue extends EventEmitter {
     if (perSourceCounts) {
       for (const [source, count] of Object.entries(perSourceCounts)) {
         this.perSourceCounts.set(source as SourceId, count);
+      }
+    }
+    // Restore rate limit state from active schedules
+    const schedules = await getActiveSchedules();
+    const now = Date.now();
+    for (const schedule of schedules) {
+      if (schedule.resumeAt > now) {
+        // Active schedule found - restore rate limit state
+        this.rateLimited = true;
+        this.rateLimitReason = schedule.reason;
+        this.rateLimitResumeAt = schedule.resumeAt;
+        break; // Only restore the first active schedule
       }
     }
     this.emit("update");

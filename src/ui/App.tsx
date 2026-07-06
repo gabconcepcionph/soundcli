@@ -246,7 +246,7 @@ export function App({ initialAdd }: { initialAdd?: string } = {}) {
       );
       // Bring back last session's queue; pending items resume from their .part.
       const { items, perSourceCounts } = await loadQueue();
-      queue.restore(items, perSourceCounts);
+      await queue.restore(items, perSourceCounts);
 
       // Auto-resume any sources whose scheduled resume time has arrived
       await queue.checkScheduledResumes();
