@@ -288,6 +288,7 @@ function QueueView() {
   const focused = region === "content";
   const [offset, setOffset] = useState(0);
   const [cooldownSeconds, setCooldownSeconds] = useState<number | null>(null);
+  const [notification, setNotification] = useState<string | null>(null);
 
   // Animated countdown for rate limit cooldown
   useEffect(() => {
@@ -306,6 +307,14 @@ function QueueView() {
 
     return () => clearInterval(interval);
   }, [s.rateLimited, s.rateLimitResumeAt]);
+
+  // Auto-clear notification after 3 seconds
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
 
   // Calculate batch progress per source
   const batchProgressBySource = useMemo(() => {
@@ -370,7 +379,11 @@ function QueueView() {
       if (input === "[") {
         if (s.downloading + s.pending > 0) queue.pauseAll();
       } else if (input === "]") {
-        if (s.paused > 0) void queue.resumeAll();
+        if (s.rateLimited) {
+          setNotification("Downloads will automatically resume after the batch cooldown");
+        } else if (s.paused > 0) {
+          void queue.resumeAll();
+        }
       } else if (input === "c") {
         if (s.downloading + s.pending + s.paused > 0) queue.cancelAll();
       } else if (key.return) {
@@ -421,6 +434,13 @@ function QueueView() {
 
   return (
     <Box flexDirection="column">
+      {notification ? (
+        <Box marginBottom={1}>
+          <Text color={COLOR.warn} wrap="truncate-end">
+            {`${ICON.warn} ${notification}`}
+          </Text>
+        </Box>
+      ) : null}
       {s.rateLimited ? (
         <Box marginBottom={1}>
           <Text color={COLOR.warn} wrap="truncate-end">
@@ -429,11 +449,6 @@ function QueueView() {
                 ? "Waiting for the audio engine (install ffmpeg if this persists)"
                 : s.rateLimitReason
             }`}
-            {cooldownSeconds !== null ? (
-              <Text dimColor>
-                {`  ${ICON.dot}  Retry in ${Math.floor(cooldownSeconds / 60)}:${(cooldownSeconds % 60).toString().padStart(2, '0')}`}
-              </Text>
-            ) : null}
             <Text dimColor>{`  ${ICON.dot}  ] resumes`}</Text>
           </Text>
         </Box>
