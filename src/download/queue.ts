@@ -131,6 +131,14 @@ export function isPermanentTrackError(text: string): boolean {
 }
 
 /**
+ * Whether an error indicates YouTube authentication is required (sign-in, age verification, etc.).
+ * These should be auto-canceled since they can't succeed without user action.
+ */
+export function isAuthError(text: string): boolean {
+  return /sign in to confirm|sign in|login|age.?verification|confirm you're not a robot/i.test(text);
+}
+
+/**
  * Concurrent download queue. Emits "update" on any change. Skips tracks already
  * in the library or already queued (no song downloads twice), records finished
  * downloads in the library, and supports instant cancel (kills yt-dlp).
@@ -996,25 +1004,34 @@ export class DownloadQueue extends EventEmitter {
         }
       }
     } catch (e) {
-      item.status = "error";
-      item.error = e instanceof Error ? e.message : String(e);
-      this.logFailure(item, item.error);
-      // A run of TRANSIENT failures almost always means we're being throttled
-      // or blocked, so pause the whole queue (resumable) instead of failing
-      // the rest silently. Permanently dead tracks say nothing about the
-      // platform, so they neither count toward nor reset the streak; they
-      // feed their own per-source streak instead, which raises the
-      // stale-downloader notice without ever pausing.
-      if (!isPermanentTrackError(item.error)) {
-        this.consecutiveErrors++;
-        if (this.consecutiveErrors >= failureStreakLimit() && !this.rateLimited) {
-          // Repeated errors: pause this source only
-          await this.onRateLimited(item.source, item.sourceLabel, "repeated download errors");
+      const errorText = e instanceof Error ? e.message : String(e);
+      // Auto-cancel YouTube auth errors (sign-in, age verification, etc.)
+      // since they can't succeed without user action
+      if (isAuthError(errorText)) {
+        item.status = "canceled";
+        item.error = errorText;
+        this.logFailure(item, errorText);
+      } else {
+        item.status = "error";
+        item.error = errorText;
+        this.logFailure(item, errorText);
+        // A run of TRANSIENT failures almost always means we're being throttled
+        // or blocked, so pause the whole queue (resumable) instead of failing
+        // the rest silently. Permanently dead tracks say nothing about the
+        // platform, so they neither count toward nor reset the streak; they
+        // feed their own per-source streak instead, which raises the
+        // stale-downloader notice without ever pausing.
+        if (!isPermanentTrackError(item.error)) {
+          this.consecutiveErrors++;
+          if (this.consecutiveErrors >= failureStreakLimit() && !this.rateLimited) {
+            // Repeated errors: pause this source only
+            await this.onRateLimited(item.source, item.sourceLabel, "repeated download errors");
+          }
+        } else if (!/drm/i.test(item.error)) {
+          // DRM is the platform telling the truth about the track, not a sign
+          // of a stale extractor, so it never feeds the out-of-date hint.
+          this.notePermanentFailure(item.sourceLabel);
         }
-      } else if (!/drm/i.test(item.error)) {
-        // DRM is the platform telling the truth about the track, not a sign
-        // of a stale extractor, so it never feeds the out-of-date hint.
-        this.notePermanentFailure(item.sourceLabel);
       }
     } finally {
       this.controllers.delete(item.id);
