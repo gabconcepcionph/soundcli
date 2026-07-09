@@ -316,23 +316,6 @@ function QueueView() {
     }
   }, [notification]);
 
-  // Calculate batch progress per source
-  const batchProgressBySource = useMemo(() => {
-    const progress = new Map<string, { current: number; limit: number }>();
-    const sources = new Set<SourceId>();
-    for (const item of items) {
-      if (item.status === "downloading" || item.status === "done" || item.status === "pending" || item.status === "paused") {
-        if (!sources.has(item.source)) {
-          sources.add(item.source);
-          const current = queue.getBatchCount(item.source);
-          const limit = queue.getBatchLimit(item.source);
-          progress.set(item.sourceLabel, { current, limit });
-        }
-      }
-    }
-    return progress;
-  }, [items, queue]);
-
   // Live rows sort to the top so at offset 0 the list follows the action;
   // failures sink to the bottom (the header count, f Retry, and the banner
   // carry them) instead of burying the queue under red rows.
@@ -449,6 +432,11 @@ function QueueView() {
                 ? "Waiting for the audio engine (install ffmpeg if this persists)"
                 : s.rateLimitReason
             }`}
+            {cooldownSeconds !== null ? (
+              <Text dimColor>
+                {`  ${ICON.dot}  Resume in ${Math.floor(cooldownSeconds / 60)}:${(cooldownSeconds % 60).toString().padStart(2, '0')} (${formatTime(s.rateLimitResumeAt)})`}
+              </Text>
+            ) : null}
             <Text dimColor>{`  ${ICON.dot}  ] resumes`}</Text>
           </Text>
         </Box>
@@ -495,36 +483,6 @@ function QueueView() {
           ) : null}
         </Text>
       </Box>
-
-      {/* Batch progress per source */}
-      {batchProgressBySource.size > 0 ? (
-        <Box marginTop={1}>
-          {Array.from(batchProgressBySource.entries()).map(([sourceLabel, batch]) => {
-            const batchRemaining = Math.max(0, batch.limit - batch.current);
-            const approachingLimit = batchRemaining <= 5;
-            const batchEmpty = batch.current >= batch.limit;
-            return (
-              <Text key={sourceLabel} dimColor>
-                {batchEmpty ? (
-                  <>
-                    {`${ICON.dot} ${sourceLabel}: batch complete`}
-                    {cooldownSeconds !== null ? (
-                      <Text color={COLOR.warn}>
-                        {`  ${ICON.dot}  Next batch in ${Math.floor(cooldownSeconds / 60)}:${(cooldownSeconds % 60).toString().padStart(2, '0')} (${formatTime(s.rateLimitResumeAt)})`}
-                      </Text>
-                    ) : null}
-                  </>
-                ) : (
-                  <>
-                    {`${ICON.dot} ${sourceLabel}: ${batchRemaining}/${batch.limit} left in batch`}
-                    {approachingLimit ? <Text color={COLOR.warn}> {ICON.warn}</Text> : null}
-                  </>
-                )}
-              </Text>
-            );
-          })}
-        </Box>
-      ) : null}
 
       <Box marginTop={1} marginBottom={1}>
         <Box width={24}>

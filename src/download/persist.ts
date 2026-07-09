@@ -20,8 +20,6 @@ export interface PersistedItem {
 interface QueueSnapshot {
   version: 1;
   items: PersistedItem[];
-  /** Per-source batch counts to resume rate limiting after restart. */
-  perSourceCounts?: Record<string, number>;
 }
 
 /**
@@ -74,11 +72,10 @@ export function restorableItems(
   );
 }
 
-export async function saveQueue(items: QueueItem[], perSourceCounts?: Map<string, number>): Promise<void> {
+export async function saveQueue(items: QueueItem[]): Promise<void> {
   const snapshot: QueueSnapshot = {
     version: 1,
     items: snapshotItems(items),
-    perSourceCounts: perSourceCounts ? Object.fromEntries(perSourceCounts) : undefined,
   };
   await fs.mkdir(path.dirname(queueFile), { recursive: true });
   const tmp = `${queueFile}.tmp`;
@@ -87,28 +84,26 @@ export async function saveQueue(items: QueueItem[], perSourceCounts?: Map<string
 }
 
 /** Synchronous save for app quit, so a partial download survives even on exit. */
-export function saveQueueSync(items: QueueItem[], perSourceCounts?: Map<string, number>): void {
+export function saveQueueSync(items: QueueItem[]): void {
   const snapshot: QueueSnapshot = {
     version: 1,
     items: snapshotItems(items),
-    perSourceCounts: perSourceCounts ? Object.fromEntries(perSourceCounts) : undefined,
   };
   mkdirSync(path.dirname(queueFile), { recursive: true });
   writeFileSync(queueFile, JSON.stringify(snapshot, null, 2), "utf8");
 }
 
-export async function loadQueue(): Promise<{ items: PersistedItem[]; perSourceCounts: Record<string, number> }> {
+export async function loadQueue(): Promise<{ items: PersistedItem[] }> {
   try {
     const raw = await fs.readFile(queueFile, "utf8");
     const parsed = JSON.parse(raw) as QueueSnapshot;
     if (parsed && parsed.version === 1 && Array.isArray(parsed.items)) {
       return {
         items: parsed.items,
-        perSourceCounts: parsed.perSourceCounts ?? {},
       };
     }
   } catch {
     // missing or invalid: nothing to restore
   }
-  return { items: [], perSourceCounts: {} };
+  return { items: [] };
 }

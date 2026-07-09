@@ -28,6 +28,14 @@ import {
   scheduleResume,
   type SourceSchedule,
 } from "./resume-schedule";
+import {
+  checkRateLimit,
+  clearSourceLog,
+  getEffectiveLimit,
+  loadDownloadLog,
+  recordDownload,
+  saveDownloadLog,
+} from "./rate-limit-log";
 
 export type QueueStatus =
   | "pending"
@@ -87,51 +95,6 @@ let counter = 0;
 
 /** Fixed number of simultaneous downloads (not user-configurable). */
 const DEFAULT_CONCURRENCY = 3;
-
-/**
- * Maximum downloads per source per batch before pausing to avoid rate limits.
- * This is "per pagination" - we download in chunks to prevent overwhelming sources.
- * Can be overridden via config.batchLimits.
- * Defaults to 60% of platform rate limits for safety (includes cooldown time).
- */
-const DEFAULT_BATCH_LIMITS: Record<string, number> = {
-  youtube: 60, // 60% of 100 requests/hour
-  soundcloud: 120, // 60% of 200 requests/hour
-  spotify: 60, // Uses YouTube's limit
-  link: 60, // Conservative default
-  local: 60, // Conservative default
-};
-
-/** Platform rate limits (requests per hour) for validation. */
-const PLATFORM_LIMITS: Record<string, number> = {
-  youtube: 100, // ~100 requests/hour
-  soundcloud: 200, // ~200-300 requests/hour (conservative)
-  spotify: 6000, // ~100-200 requests/minute = 6000-12000/hour (conservative)
-  link: 100, // No platform limit, use conservative default
-  local: 100, // No platform limit, use conservative default
-};
-
-/** 80% safety margin for platform limits. */
-const SAFETY_MARGIN = 0.8;
-
-/** Get the batch limit for a source from config or default. */
-function getBatchLimit(source: SourceId, config: Config): number {
-  // Spotify downloads via YouTube matching, so use YouTube's batch limit
-  const effectiveSource = source === "spotify" ? "youtube" : source;
-  const customLimit = config.batchLimits?.[effectiveSource as keyof Config["batchLimits"]];
-  if (customLimit !== undefined) {
-    const platformLimit = PLATFORM_LIMITS[effectiveSource] ?? 100;
-    const maxAllowed = Math.floor(platformLimit * SAFETY_MARGIN);
-    if (customLimit > maxAllowed) {
-      console.warn(
-        `Batch limit for ${source} (${customLimit}) exceeds 80% of platform limit (${maxAllowed}). Using ${maxAllowed}.`,
-      );
-      return maxAllowed;
-    }
-    return customLimit;
-  }
-  return DEFAULT_BATCH_LIMITS[effectiveSource] ?? 80;
-}
 
 /**
  * Pause the whole queue after this many hard failures in a row. A cluster of
@@ -204,20 +167,10 @@ export class DownloadQueue extends EventEmitter {
   /** One rotation check per process, so the failure log stays bounded. */
   private logRotated = false;
   /**
-   * Track downloads completed per source in the current batch for pagination.
-   * When a source reaches PER_SOURCE_BATCH_LIMIT, we pause it to avoid rate limits.
+   * Download log for time-based rate limiting (rolling 60-minute window).
+   * Tracks download timestamps per source to calculate rate limits dynamically.
    */
-  private perSourceCounts = new Map<SourceId, number>();
-
-  /** Get the current batch count for a source (for UI display). */
-  getBatchCount(source: SourceId): number {
-    return this.perSourceCounts.get(source) ?? 0;
-  }
-
-  /** Get the batch limit for a source (for UI display). */
-  getBatchLimit(source: SourceId): number {
-    return getBatchLimit(source, this.config);
-  }
+  private downloadLog = new Map<SourceId, number[]>();
   /**
    * Aborts the in-flight "gather" (the UI enumerating selected playlists and
    * streaming their tracks in via enqueue). Cancelling/clearing the queue trips
@@ -253,7 +206,8 @@ export class DownloadQueue extends EventEmitter {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      void saveQueue(this.items, this.perSourceCounts).catch(() => {});
+      void saveQueue(this.items).catch(() => {});
+      void saveDownloadLog(this.downloadLog).catch(() => {});
     }, 300);
   }
 
@@ -432,15 +386,15 @@ export class DownloadQueue extends EventEmitter {
     this.consecutiveErrors = 0;
 
     // Check if there's a schedule for this source (even if expired)
-    // If cooldown has passed, reset batch count to start fresh
+    // If cooldown has passed, clear the download log for this source
     const { loadAllSchedules, clearSchedule } = await import("./resume-schedule");
     const schedules = await loadAllSchedules();
     const schedule = schedules.find((s) => s.source === item.source);
     if (schedule) {
       const now = Date.now();
       if (schedule.resumeAt <= now) {
-        // Cooldown has passed - reset batch count to start fresh
-        this.perSourceCounts.set(item.source, 0);
+        // Cooldown has passed - clear download log for this source
+        clearSourceLog(item.source, this.downloadLog);
       }
       // Clear the schedule regardless
       await clearSchedule(item.source);
@@ -475,12 +429,12 @@ export class DownloadQueue extends EventEmitter {
         }
 
         if (resumed > 0) {
-          // Reset batch count for the resumed source to start fresh
-          this.perSourceCounts.set(schedule.source, 0);
+          // Clear download log for the resumed source to start fresh
+          clearSourceLog(schedule.source, this.downloadLog);
           this.rateLimited = false;
           this.rateLimitReason = "";
           this.rateLimitResumeAt = 0;
-          this.emit("update"); // Emit update so UI reflects batch count reset
+          this.emit("update");
           this.stopped = false;
           this.consecutiveErrors = 0;
           this.emit("update");
@@ -579,7 +533,7 @@ export class DownloadQueue extends EventEmitter {
   }
 
   /** Restore a persisted queue from a previous session. */
-  async restore(persisted: PersistedItem[], perSourceCounts?: Record<string, number>): Promise<void> {
+  async restore(persisted: PersistedItem[]): Promise<void> {
     for (const p of restorableItems(persisted, this.library)) {
       this.items.push({
         id: `q${++counter}`,
@@ -591,12 +545,8 @@ export class DownloadQueue extends EventEmitter {
         unverifiedMatch: p.unverifiedMatch,
       });
     }
-    // Restore per-source batch counts
-    if (perSourceCounts) {
-      for (const [source, count] of Object.entries(perSourceCounts)) {
-        this.perSourceCounts.set(source as SourceId, count);
-      }
-    }
+    // Restore download log from disk
+    this.downloadLog = await loadDownloadLog();
     // Restore rate limit state from active schedules
     const schedules = await getActiveSchedules();
     const now = Date.now();
@@ -621,7 +571,7 @@ export class DownloadQueue extends EventEmitter {
     this.stopped = true;
     for (const c of this.controllers.values()) c.abort();
     try {
-      saveQueueSync(this.items, this.perSourceCounts);
+      saveQueueSync(this.items);
     } catch {
       // best effort on exit
     }
@@ -992,22 +942,21 @@ export class DownloadQueue extends EventEmitter {
           item.status = "done";
           this.consecutiveErrors = 0;
           this.noteSourceSuccess(item.sourceLabel);
-          
-          // Check per-source pagination limit
-          const count = (this.perSourceCounts.get(item.source) ?? 0) + 1;
-          this.perSourceCounts.set(item.source, count);
-          this.emit("update"); // Emit update so UI reflects batch count change
-          const batchLimit = getBatchLimit(item.source, this.config);
-          if (count >= batchLimit) {
+
+          // Record download in time-based rate limit log
+          recordDownload(item.source, this.downloadLog);
+
+          // Check if we've hit the rate limit
+          const rateCheck = checkRateLimit(item.source, this.downloadLog);
+          if (rateCheck.rateLimited) {
             // Schedule a pause for this source to avoid rate limits
             const remaining = this.items.filter(
               (i) => i.source === item.source && (i.status === "pending" || i.status === "downloading"),
             ).length;
-            // Always create a schedule so the countdown shows in UI
-            const resumeAt = await scheduleResume(item.source, item.sourceLabel, remaining, `batch limit reached (${batchLimit})`);
-            // Set rate limit flags so UI shows countdown
+            const resumeAt = Date.now() + rateCheck.cooldownMs;
+            await scheduleResume(item.source, item.sourceLabel, remaining, `rate limit reached (${rateCheck.currentCount}/${getEffectiveLimit(item.source)} in last hour)`);
             this.rateLimited = true;
-            this.rateLimitReason = `batch limit reached (${batchLimit})`;
+            this.rateLimitReason = `rate limit reached (${rateCheck.currentCount}/${getEffectiveLimit(item.source)} in last hour)`;
             this.rateLimitResumeAt = resumeAt;
             // Pause remaining items from this source
             for (const i of this.items) {
@@ -1016,8 +965,6 @@ export class DownloadQueue extends EventEmitter {
                 i.percent = 0;
               }
             }
-            // Don't reset batch count here - keep it at limit so it persists correctly
-            // Reset will happen when the schedule expires and downloads resume
           }
         }
       } else {
@@ -1026,19 +973,19 @@ export class DownloadQueue extends EventEmitter {
         this.consecutiveErrors = 0;
         this.noteSourceSuccess(item.sourceLabel);
 
-        // Increment batch count for skipped items too (they still hit the API)
-        const count = (this.perSourceCounts.get(item.source) ?? 0) + 1;
-        this.perSourceCounts.set(item.source, count);
-        this.emit("update"); // Emit update so UI reflects batch count change
-        const batchLimit = getBatchLimit(item.source, this.config);
-        if (count >= batchLimit) {
+        // Record download in time-based rate limit log (skipped items still hit API)
+        recordDownload(item.source, this.downloadLog);
+
+        // Check if we've hit the rate limit
+        const rateCheck = checkRateLimit(item.source, this.downloadLog);
+        if (rateCheck.rateLimited) {
           const remaining = this.items.filter(
             (i) => i.source === item.source && (i.status === "pending" || i.status === "downloading"),
           ).length;
-          const resumeAt = await scheduleResume(item.source, item.sourceLabel, remaining, `batch limit reached (${batchLimit})`);
-          // Set rate limit flags so UI shows countdown
+          const resumeAt = Date.now() + rateCheck.cooldownMs;
+          await scheduleResume(item.source, item.sourceLabel, remaining, `rate limit reached (${rateCheck.currentCount}/${getEffectiveLimit(item.source)} in last hour)`);
           this.rateLimited = true;
-          this.rateLimitReason = `batch limit reached (${batchLimit})`;
+          this.rateLimitReason = `rate limit reached (${rateCheck.currentCount}/${getEffectiveLimit(item.source)} in last hour)`;
           this.rateLimitResumeAt = resumeAt;
           for (const i of this.items) {
             if (i.source === item.source && i.status === "pending") {

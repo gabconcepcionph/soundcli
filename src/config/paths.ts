@@ -33,3 +33,6 @@ export const downloadLogFile = path.join(paths.log, "downloads.log");
 
 /** Resume schedule tracking for rate-limited downloads per source. */
 export const resumeScheduleFile = path.join(paths.data, "resume-schedule.json");
+
+/** Download log for time-based rate limiting (rolling 60-minute window). */
+export const rateLimitLogFile = path.join(paths.data, "rate-limit-log.json");
