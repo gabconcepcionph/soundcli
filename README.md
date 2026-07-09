@@ -34,18 +34,16 @@ Every track downloads in its original quality, with album artwork and artist det
 
 It never downloads the same song twice, and if you close it mid-download, it picks up where it left off next time. Once a track is saved, it's there for good.
 
-## Rate limiting & batch downloads
+## Rate limiting
 
-To avoid overwhelming platforms, soundcli downloads in batches with automatic cooldowns:
+To avoid overwhelming platforms, soundcli uses time-based rate limiting with a rolling 60-minute window:
 
-- **YouTube/Spotify**: 60 tracks per batch, then 30-minute cooldown
-- **SoundCloud**: 120 tracks per batch, then 15-minute cooldown
+- **YouTube/Spotify**: 80 tracks per hour (80% of 100/hour platform limit)
+- **SoundCloud**: 160 tracks per hour (80% of 200/hour platform limit)
 
-When a batch completes, downloads pause automatically and a countdown shows when the next batch starts. The queue resumes on its own—no manual intervention needed. If a platform rate-limits early (e.g., HTTP 429), the cooldown triggers immediately with the exact error message displayed.
+Downloads continue until the platform limit is reached within the 60-minute window, then pause automatically. The cooldown is calculated dynamically based on when the oldest download in the window will expire, so you only wait as long as necessary. The queue resumes on its own—no manual intervention needed.
 
-Batch progress is shown in the Download section:
-- `• YouTube: 45/60 left in batch` - tracks remaining in current batch
-- `• YouTube: batch complete  •  Next batch in 18:45` - cooldown countdown (MM:SS)
+If a platform rate-limits early (e.g., HTTP 429), the cooldown triggers immediately with the exact error message displayed. Rate limit state persists across restarts, so the cooldown timer survives app quits.
 
 ## Playing it back
 
