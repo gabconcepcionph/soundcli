@@ -20,6 +20,8 @@ export interface Config {
   firstRunComplete: boolean;
   /** Check for yt-dlp updates at every launch (staged, applied when idle). */
   ytdlpAutoUpdate?: boolean;
+  /** Download rate limit for yt-dlp (e.g., "5M" for 5 MB/s). */
+  downloadRateLimit?: string;
   /** Per-source batch limits for rate limiting (max 80% of platform limits). */
   batchLimits?: {
     youtube?: number;

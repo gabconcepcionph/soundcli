@@ -1010,7 +1010,7 @@ export class DownloadQueue extends EventEmitter {
       if (isAuthError(errorText)) {
         item.status = "canceled";
         item.error = errorText;
-        this.logFailure(item, errorText);
+        // Don't log auth errors - they're user-action required, not failures
       } else {
         item.status = "error";
         item.error = errorText;

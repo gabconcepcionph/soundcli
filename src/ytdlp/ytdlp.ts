@@ -165,7 +165,7 @@ export interface DownloadResult {
 
 /** Whether an error looks like the platform rate-limiting / bot-gating us. */
 export function isRateLimitError(text: string): boolean {
-  return /HTTP Error 429|Too Many Requests|rate.?limit|sign in to confirm|not a bot|temporarily blocked/i.test(
+  return /HTTP Error 429|Too Many Requests|rate.?limit|not a bot|temporarily blocked/i.test(
     text,
   );
 }
@@ -225,6 +225,11 @@ export async function downloadTrack(
     metaTpl,
     url,
   ];
+
+  // Add rate limit if configured (e.g., "5M" for 5 MB/s)
+  if (config.downloadRateLimit) {
+    args.splice(args.indexOf(url), 0, "--limit-rate", config.downloadRateLimit);
+  }
 
   const subprocess = execa(resolvedYtDlpPath(), args, {
     env: toolEnv(),
