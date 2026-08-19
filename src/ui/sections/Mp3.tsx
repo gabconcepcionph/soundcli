@@ -40,12 +40,14 @@ export function Mp3() {
 
   useEffect(() => {
     loadMp3Files();
-  }, [config.libraryDir]);
+    // Reload when the library dir moves, and whenever this section gains
+    // focus: a conversion run from Library/Playlists writes new files while
+    // the MP3 section is hidden, and the only signal we get is the focus flip.
+  }, [config.libraryDir, focused]);
 
   const loadMp3Files = async () => {
     try {
       const mp3Dir = path.join(config.libraryDir, "mp3");
-      const files: Mp3File[] = [];
 
       // Check if mp3 directory exists
       try {
@@ -56,36 +58,36 @@ export function Mp3() {
         return;
       }
 
-      // Read mp3 directory
-      const entries = await fs.readdir(mp3Dir, { withFileTypes: true });
-
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          // It's a playlist subdirectory
-          const subDirPath = path.join(mp3Dir, entry.name);
-          const subEntries = await fs.readdir(subDirPath);
-          for (const subEntry of subEntries) {
-            if (subEntry.endsWith(".mp3")) {
-              const fullPath = path.join(subDirPath, subEntry);
+      // Recursively walk mp3/ so the mirrored layout
+      //   mp3/<Source>/<owner?>/<playlist>/<file>.mp3
+      // shows up alongside the older flat / one-level forms.
+      const files: Mp3File[] = [];
+      const stack: string[] = [mp3Dir];
+      while (stack.length > 0) {
+        const dir = stack.pop()!;
+        let entries: import("node:fs").Dirent[];
+        try {
+          entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            stack.push(fullPath);
+          } else if (entry.isFile() && entry.name.endsWith(".mp3")) {
+            try {
               const stats = await fs.stat(fullPath);
-              files.push({
-                path: fullPath,
-                name: subEntry,
-                size: stats.size,
-              });
+              files.push({ path: fullPath, name: entry.name, size: stats.size });
+            } catch {
+              // vanished between readdir and stat: skip
             }
           }
-        } else if (entry.name.endsWith(".mp3")) {
-          // It's a direct mp3 file
-          const fullPath = path.join(mp3Dir, entry.name);
-          const stats = await fs.stat(fullPath);
-          files.push({
-            path: fullPath,
-            name: entry.name,
-            size: stats.size,
-          });
         }
       }
+
+      // Newest first is more useful than readdir's arbitrary order.
+      files.sort((a, b) => b.path.localeCompare(a.path));
 
       setMp3Files(files);
       setCurrentDir(mp3Dir);
@@ -135,7 +137,32 @@ export function Mp3() {
     meta: `${(f.size / 1024 / 1024).toFixed(1)} MB`,
   });
 
-  const groups: SongGroup[] = [{ items: mp3Files.map(toItem) }];
+  // Group by the immediate parent folder (the playlist dir in the mirrored
+  // layout). Files sitting directly under mp3/ with no folder fall into a
+ // headerless lead group so the flat-convert case still renders cleanly.
+  const groups: SongGroup[] = useMemo(() => {
+    const byGroup = new Map<string, Mp3File[]>();
+    const flat: Mp3File[] = [];
+    for (const f of mp3Files) {
+      const parent = path.basename(path.dirname(f.path));
+      if (parent === "mp3") {
+        flat.push(f);
+      } else {
+        const list = byGroup.get(parent);
+        if (list) list.push(f);
+        else byGroup.set(parent, [f]);
+      }
+    }
+    const sortedGroups = [...byGroup.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
+    );
+    const out: SongGroup[] = [];
+    if (flat.length > 0) out.push({ items: flat.map(toItem) });
+    for (const [title, files] of sortedGroups) {
+      out.push({ title, items: files.map(toItem) });
+    }
+    return out;
+  }, [mp3Files]);
 
   const subtitle = `${mp3Files.length} file${mp3Files.length === 1 ? "" : "s"}`;
 
