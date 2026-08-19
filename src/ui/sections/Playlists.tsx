@@ -11,11 +11,10 @@ import { cleanText, formatDuration, formatRuntime } from "../../util/format";
 import { deleteTracks } from "../../library/delete";
 import { displaySource } from "../../library/drift";
 import { SOURCE_LABELS, type SourceId, type Track } from "../../library/types";
+import { convertTracksToMp3 } from "../../library/convert";
 import { shuffledOrder } from "../../player/order";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { execa } from "execa";
-import { resolvedFfmpegPath } from "../../bin/ffmpeg-fetch";
 
 const SOURCE_ORDER: SourceId[] = [
   "youtube",
@@ -225,11 +224,25 @@ export function Playlists() {
 
   useInput(
     (input) => {
-      if (input === "t" && !confirm && selectedTrackId) {
+      if (input === "t" && !confirm && !songFiltering && selectedTrackId) {
         const track = library.get(selectedTrackId);
         if (track) {
           setRenamingTrackId(track.id);
           setNewTrackTitle(track.title);
+        }
+        return;
+      }
+      if (input === "c" && !confirm && !songFiltering && !renamingTrack && active) {
+        const tracksToConvert = active.tracks.filter(
+          (t) => !t.filePath.endsWith(".mp3")
+        );
+        if (tracksToConvert.length > 0) {
+          setConfirm({
+            kind: "convert",
+            setKey: active.key,
+            label: active.name,
+            count: tracksToConvert.length,
+          });
         }
         return;
       }
@@ -387,47 +400,17 @@ export function Playlists() {
     setConvertProgress("Starting conversion…");
 
     try {
-      // Create mp3 directory per playlist
-      const mp3Dir = path.join(config.libraryDir, "mp3", cleanText(setInfo.name));
-      await fs.mkdir(mp3Dir, { recursive: true });
-
       const tracksToConvert = setInfo.tracks.filter(
         (t) => !t.filePath.endsWith(".mp3")
       );
-
-      let converted = 0;
-      for (const track of tracksToConvert) {
-        const baseName = path.basename(track.filePath, path.extname(track.filePath));
-        const mp3Path = path.join(mp3Dir, `${baseName}.mp3`);
-
-        // Skip if mp3 already exists
-        try {
-          await fs.access(mp3Path);
-          converted++;
-          continue;
-        } catch {
-          // File doesn't exist, proceed with conversion
-        }
-
-        setConvertProgress(
-          `Converting ${converted + 1}/${tracksToConvert.length}: ${track.title}`
-        );
-
-        try {
-          await execa(resolvedFfmpegPath(), [
-            "-i",
-            track.filePath,
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            mp3Path,
-          ]);
-          converted++;
-        } catch (e) {
-          console.error(`Failed to convert ${track.title}:`, e);
-        }
-      }
+      const { converted } = await convertTracksToMp3(
+        config.libraryDir,
+        tracksToConvert,
+        (p) =>
+          setConvertProgress(
+            `Converting ${p.done}/${p.total}: ${p.track.title}`
+          ),
+      );
 
       setConvertProgress(
         `Conversion complete: ${converted}/${tracksToConvert.length} songs converted`
