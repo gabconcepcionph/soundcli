@@ -9,10 +9,20 @@ import { SongList, type SongGroup } from "../components/SongList";
 import { COLOR, ICON } from "../theme";
 import { cleanText, formatDuration, formatRuntime } from "../../util/format";
 import { deleteTracks } from "../../library/delete";
+import { displaySource } from "../../library/drift";
 import { SOURCE_LABELS, type SourceId, type Track } from "../../library/types";
+import { convertTracksToMp3 } from "../../library/convert";
 import { shuffledOrder } from "../../player/order";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 
-const SOURCE_ORDER: SourceId[] = ["youtube", "soundcloud", "spotify", "link"];
+const SOURCE_ORDER: SourceId[] = [
+  "youtube",
+  "soundcloud",
+  "spotify",
+  "link",
+  "local",
+];
 
 interface SetInfo {
   key: string;
@@ -27,7 +37,8 @@ type View = { kind: "sets" } | { kind: "songs"; setKey: string };
 /** Pending delete: one song, or a whole set with everything in it. */
 type Confirm =
   | { kind: "song"; id: string; label: string }
-  | { kind: "set"; key: string; label: string; count: number };
+  | { kind: "set"; key: string; label: string; count: number }
+  | { kind: "convert"; setKey: string; label: string; count: number };
 
 /**
  * Browse the library by set (playlist / likes collection) instead of as one
@@ -61,6 +72,13 @@ export function Playlists() {
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
   const [newTrackTitle, setNewTrackTitle] = useState("");
+  const [converting, setConverting] = useState(false);
+  const [convertProgress, setConvertProgress] = useState<string | null>(null);
+  const [selectedSetKey, setSelectedSetKey] = useState<string | null>(null);
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
+  // Search inside the open set, mirroring the Library search box.
+  const [songQ, setSongQ] = useState("");
+  const [songFiltering, setSongFiltering] = useState(false);
 
   const songs = useMemo(
     // library.all() is already newest-first; recompute on new downloads and
@@ -71,16 +89,19 @@ export function Playlists() {
   );
 
   // Bucket tracks into sets, preserving first-appearance (newest-first) order.
+  // Sets group under the top-level folder their files sit in (like the
+  // Library tabs), so re-sorting on disk re-homes them here too.
   const sets = useMemo(() => {
     const byKey = new Map<string, SetInfo>();
     const ordered: SetInfo[] = [];
     for (const t of songs) {
-      const key = `${t.source}|${t.owner ?? ""}|${t.playlist ?? "Other"}`;
+      const src = displaySource(t, config.libraryDir);
+      const key = `${src}|${t.owner ?? ""}|${t.playlist ?? "Other"}`;
       let s = byKey.get(key);
       if (!s) {
         s = {
           key,
-          source: t.source,
+          source: src,
           owner: t.owner,
           name: t.playlist ?? "Other",
           tracks: [],
@@ -91,7 +112,7 @@ export function Playlists() {
       s.tracks.push(t);
     }
     return ordered;
-  }, [songs]);
+  }, [songs, config.libraryDir]);
 
   const searching = q.trim().length > 0;
   const qLower = q.toLowerCase();
@@ -140,6 +161,13 @@ export function Playlists() {
     if (view.kind === "songs" && !active) setView({ kind: "sets" });
   }, [view, active]);
 
+  // A fresh drill-down starts unfiltered.
+  const activeKey = view.kind === "songs" ? view.setKey : undefined;
+  useEffect(() => {
+    setSongQ("");
+    setSongFiltering(false);
+  }, [activeKey]);
+
   useEffect(() => {
     setPlaylistsDepth(view.kind === "songs" ? "songs" : "sets");
     return () => setPlaylistsDepth("sets");
@@ -151,15 +179,16 @@ export function Playlists() {
   const filteringSets = inSets && filtering;
   const renamingSet = inSets && renamingSetKey !== null;
   const renamingTrack = inSongs && renamingTrackId !== null;
+  const filteringSongs = inSongs && songFiltering;
   useEffect(() => {
     // The sets list claims no special mode: like Library, a plain esc falls
     // through to the global handler and returns focus to the sidebar. Only the
-    // filter box (text) and the songs drill-down / delete confirm (esc, each
+    // search boxes (text) and the songs drill-down / delete confirm (esc, each
     // with its own handler) capture keys. ("picker" would swallow esc here.)
     setCaptureMode(
       confirming
         ? "esc"
-        : filteringSets
+        : filteringSets || filteringSongs
           ? "text"
           : renamingSet
             ? "text"
@@ -170,7 +199,7 @@ export function Playlists() {
                 : "none",
     );
     return () => setCaptureMode("none");
-  }, [confirming, filteringSets, inSongs, renamingSet, renamingTrack, setCaptureMode]);
+  }, [confirming, filteringSets, filteringSongs, inSongs, renamingSet, renamingTrack, setCaptureMode]);
 
   function stepSourceTab(dir: -1 | 1): void {
     const i = tabs.indexOf(filter);
@@ -178,19 +207,42 @@ export function Playlists() {
   }
 
   useInput(
-    (_input, key) => {
+    (input, key) => {
       if (key.escape) setView({ kind: "sets" });
+      else if (input === "/") setSongFiltering(true);
     },
-    { isActive: inSongs && !confirm && !renamingTrack },
+    { isActive: inSongs && !confirm && !songFiltering },
+  );
+
+  // esc closes the in-set search box (back to browsing), keeping the query.
+  useInput(
+    (_input, key) => {
+      if (key.escape) setSongFiltering(false);
+    },
+    { isActive: inSongs && songFiltering },
   );
 
   useInput(
     (input) => {
-      if (input === "t" && !confirm && active) {
-        const firstTrack = active.tracks.length > 0 ? active.tracks[0] : null;
-        if (firstTrack) {
-          setRenamingTrackId(firstTrack.id);
-          setNewTrackTitle(firstTrack.title);
+      if (input === "t" && !confirm && !songFiltering && selectedTrackId) {
+        const track = library.get(selectedTrackId);
+        if (track) {
+          setRenamingTrackId(track.id);
+          setNewTrackTitle(track.title);
+        }
+        return;
+      }
+      if (input === "c" && !confirm && !songFiltering && !renamingTrack && active) {
+        const tracksToConvert = active.tracks.filter(
+          (t) => !t.filePath.endsWith(".mp3")
+        );
+        if (tracksToConvert.length > 0) {
+          setConfirm({
+            kind: "convert",
+            setKey: active.key,
+            label: active.name,
+            count: tracksToConvert.length,
+          });
         }
         return;
       }
@@ -218,7 +270,22 @@ export function Playlists() {
       setNewTrackTitle("");
       return;
     }
-    await library.upsert({ ...track, title: newTitle });
+
+    // Move the file on disk to match the new title
+    const oldPath = track.filePath;
+    const oldDir = path.dirname(oldPath);
+    const oldExt = path.extname(oldPath);
+    const newPath = path.join(oldDir, `${cleanText(newTitle)}${oldExt}`);
+
+    try {
+      await fs.rename(oldPath, newPath);
+      await library.upsert({ ...track, title: newTitle, filePath: newPath });
+    } catch (e) {
+      console.error("Failed to rename file:", e);
+      // Still update metadata even if file move failed
+      await library.upsert({ ...track, title: newTitle });
+    }
+
     setRenamingTrackId(null);
     setNewTrackTitle("");
   };
@@ -229,11 +296,28 @@ export function Playlists() {
         setFiltering(true);
         return;
       }
-      if (input === "t" && !filtering && !confirm) {
-        const selectedSet = visibleSets.length > 0 ? visibleSets[0] : null;
+      if (input === "t" && !filtering && !confirm && selectedSetKey) {
+        const selectedSet = sets.find((s) => s.key === selectedSetKey);
         if (selectedSet) {
           setRenamingSetKey(selectedSet.key);
           setNewPlaylistName(selectedSet.name);
+        }
+        return;
+      }
+      if (input === "c" && !filtering && !confirm && !renamingSet) {
+        const selectedSet = visibleSets.length > 0 ? visibleSets[0] : null;
+        if (selectedSet) {
+          const tracksToConvert = selectedSet.tracks.filter(
+            (t) => !t.filePath.endsWith(".mp3")
+          );
+          if (tracksToConvert.length > 0) {
+            setConfirm({
+              kind: "convert",
+              setKey: selectedSet.key,
+              label: selectedSet.name,
+              count: tracksToConvert.length,
+            });
+          }
         }
         return;
       }
@@ -271,13 +355,74 @@ export function Playlists() {
       setNewPlaylistName("");
       return;
     }
-    const tracksToUpdate = targetSet.tracks.map((t) => ({
-      ...t,
-      playlist: newName,
-    }));
+
+    // Move the folder on disk for each track
+    const tracksToUpdate = [];
+    for (const track of targetSet.tracks) {
+      const oldPath = track.filePath;
+      const oldDir = path.dirname(oldPath);
+      const oldBaseName = path.basename(oldPath, path.extname(oldPath));
+      const oldExt = path.extname(oldPath);
+      
+      // The folder structure is: libraryDir/source/owner/playlist/filename
+      // We need to rename the playlist folder
+      const pathParts = oldDir.split(path.sep);
+      const playlistIndex = pathParts.findIndex((p) => p === cleanText(oldName));
+      
+      if (playlistIndex >= 0) {
+        pathParts[playlistIndex] = cleanText(newName);
+        const newDir = pathParts.join(path.sep);
+        const newPath = path.join(newDir, `${oldBaseName}${oldExt}`);
+        
+        try {
+          // Create new directory if it doesn't exist
+          await fs.mkdir(newDir, { recursive: true });
+          await fs.rename(oldPath, newPath);
+          tracksToUpdate.push({ ...track, playlist: newName, filePath: newPath });
+        } catch (e) {
+          console.error(`Failed to move file for ${track.title}:`, e);
+          // Still update metadata even if file move failed
+          tracksToUpdate.push({ ...track, playlist: newName });
+        }
+      } else {
+        // Fallback: just update metadata
+        tracksToUpdate.push({ ...track, playlist: newName });
+      }
+    }
+
     await library.upsertMany(tracksToUpdate);
     setRenamingSetKey(null);
     setNewPlaylistName("");
+  };
+
+  const convertPlaylistToMp3 = async (setInfo: SetInfo) => {
+    setConverting(true);
+    setConvertProgress("Starting conversion…");
+
+    try {
+      const tracksToConvert = setInfo.tracks.filter(
+        (t) => !t.filePath.endsWith(".mp3")
+      );
+      const { converted } = await convertTracksToMp3(
+        config.libraryDir,
+        tracksToConvert,
+        (p) =>
+          setConvertProgress(
+            `Converting ${p.done}/${p.total}: ${p.track.title}`
+          ),
+      );
+
+      setConvertProgress(
+        `Conversion complete: ${converted}/${tracksToConvert.length} songs converted`
+      );
+      setTimeout(() => setConvertProgress(null), 3000);
+    } catch (e) {
+      setConvertProgress("Conversion failed");
+      console.error("Conversion error:", e);
+      setTimeout(() => setConvertProgress(null), 3000);
+    } finally {
+      setConverting(false);
+    }
   };
 
   // y commits the pending delete (one song, or a whole set and its folder),
@@ -287,6 +432,14 @@ export function Playlists() {
     (input, key) => {
       if (key.escape) setConfirm(null);
       else if (input === "y" && confirm) {
+        if (confirm.kind === "convert") {
+          setConfirm(null);
+          const targetSet = sets.find((s) => s.key === confirm.setKey);
+          if (targetSet) {
+            void convertPlaylistToMp3(targetSet);
+          }
+          return;
+        }
         const victims =
           confirm.kind === "set"
             ? (sets.find((s) => s.key === confirm.key)?.tracks ?? [])
@@ -304,6 +457,11 @@ export function Playlists() {
 
   function confirmText(): string {
     if (!confirm) return "";
+    if (confirm.kind === "convert") {
+      return `Convert '${cleanText(confirm.label)}' to MP3  ${ICON.dot}  ${confirm.count} song${
+        confirm.count === 1 ? "" : "s"
+      }?  y Convert  ${ICON.dot}  esc Cancel`;
+    }
     return confirm.kind === "set"
       ? `Delete '${cleanText(confirm.label)}'  ${ICON.dot}  ${confirm.count} song${
           confirm.count === 1 ? "" : "s"
@@ -340,6 +498,17 @@ export function Playlists() {
     ]
       .filter(Boolean)
       .join(`  ${ICON.dot}  `);
+    // Songs narrowed to the in-set search; play/shuffle scope to the matches.
+    const sq = songQ.trim().toLowerCase();
+    const shown = sq
+      ? active.tracks.filter(
+          (t) =>
+            t.title.toLowerCase().includes(sq) ||
+            (t.artist?.toLowerCase().includes(sq) ?? false),
+        )
+      : active.tracks;
+    const sn = shown.length;
+    const showSongSearchRow = songFiltering || sq.length > 0;
     return (
       <Box flexDirection="column">
         <Header title={setLabel(active)} subtitle={subtitle} focused={focused} />
@@ -358,46 +527,69 @@ export function Playlists() {
               onSubmit={handleTrackRenameSubmit}
             />
           </Box>
+        ) : showSongSearchRow ? (
+          <Box marginBottom={compact ? 0 : 1} flexShrink={0}>
+            <Text dimColor>{`${ICON.pointer} `}</Text>
+            {focused && songFiltering ? (
+              <TextField
+                defaultValue={songQ}
+                placeholder="Search this playlist…"
+                onChange={setSongQ}
+                onSubmit={() => setSongFiltering(false)}
+              />
+            ) : (
+              <Box flexGrow={1} minWidth={0}>
+                <Text dimColor wrap="truncate-end">
+                  {songQ}
+                </Text>
+              </Box>
+            )}
+          </Box>
         ) : null}
-        <SongList
-          key={active.key}
-          groups={[
-            {
-              items: active.tracks.map((t) => ({
-                value: t.id,
-                title: t.title,
-                artist: t.artist,
-                meta: formatDuration(t.durationSec),
-              })),
-            },
-          ]}
-          action={
-            n > 1
-              ? {
-                  value: "__shuffle__",
-                  label: `${ICON.shuffle} Shuffle`,
-                }
-              : undefined
-          }
-          numbered
-          actionGap={n > 1}
-          playingId={playingId}
-          focused={focused && !confirm && !renamingTrack}
-          reserveRows={confirm || renamingTrack ? 1 : 0}
-          onDelete={(value) => {
-            const t = library.get(value);
-            if (t) setConfirm({ kind: "song", id: t.id, label: t.title });
-          }}
-          onSelect={(value) => {
-            if (value === "__shuffle__") {
-              const list = shuffledOrder(n, -1).map((i) => active.tracks[i]!);
-              if (list.length > 0) playTrack(list[0]!, list);
-              return;
+        {sq && sn === 0 ? (
+          <Text dimColor>No matches.</Text>
+        ) : (
+          <SongList
+            key={active.key}
+            groups={[
+              {
+                items: shown.map((t) => ({
+                  value: t.id,
+                  title: t.title,
+                  artist: t.artist,
+                  meta: formatDuration(t.durationSec),
+                })),
+              },
+            ]}
+            action={
+              sn > 1
+                ? {
+                    value: "__shuffle__",
+                    label: `${ICON.shuffle} Shuffle`,
+                  }
+                : undefined
             }
-            const t = library.get(value);
-            if (t) playTrack(t, active.tracks);
-          }}
-        />
+            numbered
+            actionGap={sn > 1}
+            playingId={playingId}
+            focused={focused && !confirm && !renamingTrack && !songFiltering}
+            reserveRows={confirm || renamingTrack || showSongSearchRow ? 1 : 0}
+            onDelete={(value) => {
+              const t = library.get(value);
+              if (t) setConfirm({ kind: "song", id: t.id, label: t.title });
+            }}
+            onSelect={(value) => {
+              if (value === "__shuffle__") {
+                const list = shuffledOrder(sn, -1).map((i) => shown[i]!);
+                if (list.length > 0) playTrack(list[0]!, list);
+                return;
+              }
+              const t = library.get(value);
+              if (t) playTrack(t, shown);
+            }}
+            getSelectedValue={setSelectedTrackId}
+          />
+        )}
       </Box>
     );
   }
@@ -437,7 +629,11 @@ export function Playlists() {
       <SourceTabs tabs={tabs} active={filter} count={tabCount} />
       {showSearchRow ? (
         <Box marginBottom={compact ? 0 : 1} flexShrink={0}>
-          {confirm ? (
+          {converting && convertProgress ? (
+            <Text color={COLOR.accent} wrap="truncate-end">
+              {convertProgress}
+            </Text>
+          ) : confirm ? (
             <Text color={COLOR.warn} wrap="truncate-end">
               {confirmText()}
             </Text>
@@ -491,6 +687,7 @@ export function Playlists() {
               });
           }}
           onSelect={(value) => setView({ kind: "songs", setKey: value })}
+          getSelectedValue={setSelectedSetKey}
         />
       )}
     </Box>
